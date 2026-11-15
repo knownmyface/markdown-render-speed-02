@@ -461,8 +461,11 @@ function isAsciiPunct(ch) {
 }
 
 const EMAIL_CHARS = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.!#$%&'*+/=?^_`{|}~-";
+const EMAIL_SET = new Uint8Array(128);
+for (let k = 0; k < EMAIL_CHARS.length; k++) EMAIL_SET[EMAIL_CHARS.charCodeAt(k)] = 1;
 function isEmailChar(ch) {
-  return ch.length === 1 && EMAIL_CHARS.indexOf(ch) !== -1;
+  const code = ch.charCodeAt(0);
+  return code < 128 && EMAIL_SET[code] === 1;
 }
 
 function isAlnum(ch) {
@@ -534,19 +537,27 @@ function maskSrc(src, ctx) {
     };
     masked = masked.replace(REFLINK_SEARCH, maskReflink);
   }
-  masked = masked.replace(ANY_PUNCT_OUTSIDE_CODE, (m0, code, punct) => {
-    if (punct) return '+'.repeat(m0.length);
-    if (code) return code + m0.slice(code.length, -code.length).replace(/`/g, '+') + code;
-    return m0;
-  });
+  // Escapes and code spans only exist when the source holds a backslash or
+  // a backtick; otherwise the punctuation pass scans the whole string for
+  // nothing.
+  if (masked.includes('\\') || masked.includes('`')) {
+    masked = masked.replace(ANY_PUNCT_OUTSIDE_CODE, (m0, code, punct) => {
+      if (punct) return '+'.repeat(m0.length);
+      if (code) return code + m0.slice(code.length, -code.length).replace(/`/g, '+') + code;
+      return m0;
+    });
+  }
   // Block-skip matches (links, code spans, html) are masked as a bracketed
   // run so emphasis never sees their delimiters. The second group is the
   // (empty) context capture before a code span; its length is the offset
-  // that stays unmasked.
-  masked = masked.replace(BLOCK_SKIP, (m0, _link, context) => {
-    const offset = context ? context.length : 0;
-    return m0.slice(0, offset) + '[' + 'a'.repeat(m0.length - offset - 2) + ']';
-  });
+  // that stays unmasked. It can only match when the source holds '[', '`'
+  // or '<'.
+  if (masked.includes('[') || masked.includes('`') || masked.includes('<')) {
+    masked = masked.replace(BLOCK_SKIP, (m0, _link, context) => {
+      const offset = context ? context.length : 0;
+      return m0.slice(0, offset) + '[' + 'a'.repeat(m0.length - offset - 2) + ']';
+    });
+  }
   return masked;
 }
 
@@ -1013,12 +1024,22 @@ function scanText(src, from, ctx) {
       continue;
     }
     if ((ch === 'h' || ch === 'H' || ch === 'f' || ch === 'F')) {
-      const rest = src.slice(i, i + 8).toLowerCase();
-      if (rest.startsWith('http://') || rest.startsWith('https://') || rest.startsWith('ftp://')) break;
+      // Scheme check without allocating a lowercased slice: compare the
+      // next characters case-insensitively via char codes.
+      const a = src.charCodeAt(i + 1) | 32, b = src.charCodeAt(i + 2) | 32, c = src.charCodeAt(i + 3) | 32;
+      if ((ch === 'h' || ch === 'H') && a === 116 && b === 116 && c === 112) {
+        const d = src.charCodeAt(i + 4);
+        if (d === 58 && src[i + 5] === '/' && src[i + 6] === '/') break; // http://
+        if ((d | 32) === 115 && src[i + 5] === ':' && src[i + 6] === '/' && src[i + 7] === '/') break; // https://
+      } else if ((ch === 'f' || ch === 'F') && a === 116 && b === 112 && src[i + 3] === ':' && src[i + 4] === '/' && src[i + 5] === '/') break; // ftp://
     }
     if (ch === 'm' || ch === 'x') {
-      const rest = src.slice(i, i + 7).toLowerCase();
-      if ((rest.startsWith('mailto:') || rest.startsWith('xmpp:')) && (i === firstEnd || !isAlnum(src[i - 1]))) break;
+      // mailto: / xmpp: without allocating a lowercased slice.
+      const a = src.charCodeAt(i + 1) | 32, b = src.charCodeAt(i + 2) | 32, c = src.charCodeAt(i + 3) | 32,
+        d = src.charCodeAt(i + 4) | 32, e = src.charCodeAt(i + 5) | 32;
+      const isMailto = ch === 'm' && a === 97 && b === 105 && c === 108 && d === 116 && e === 111 && src[i + 6] === ':';
+      const isXmpp = ch === 'x' && a === 109 && b === 112 && c === 112 && src[i + 4] === ':';
+      if ((isMailto || isXmpp) && (i === firstEnd || !isAlnum(src[i - 1]))) break;
     }
     // E-mail start: a run of e-mail characters followed by '@', begun right
     // after the run's first character, or after a non-e-mail character.
@@ -1360,7 +1381,9 @@ function parseList(src, pos, ctx) {
     const firstLine = m[2].split('\n', 1)[0];
     const bulletIndent = m[1].length;
     let line = firstLine.replace(RE.leadSpaceTab, (ws) => expandTabs(ws, bulletIndent));
-    let nextLine = src.slice(cur).split('\n', 1)[0];
+    let nextLineEnd = src.indexOf('\n', cur);
+    if (nextLineEnd === -1) nextLineEnd = src.length;
+    let nextLine = src.slice(cur, nextLineEnd);
     let blankLine = !line.trim();
     let indent = 0;
     if (blankLine) {
@@ -1383,16 +1406,24 @@ function parseList(src, pos, ctx) {
       const htmlBeginRegex = htmlBeginRe(indent);
       const blockquoteBeginRegex = blockquoteBeginRe(indent);
       while (cur < src.length) {
-        const rawLine = src.slice(cur).split('\n', 1)[0];
+        let lineEnd = src.indexOf('\n', cur);
+        if (lineEnd === -1) lineEnd = src.length;
+        const rawLine = src.slice(cur, lineEnd);
         nextLine = rawLine;
-        const nextLineWithoutTabs = nextLine.replace(RE.leadSpaceTab, (ws) => expandTabs(ws));
-        if (fencesBeginRegex.test(nextLine)) break;
-        if (headingBeginRegex.test(nextLine)) break;
-        if (htmlBeginRegex.test(nextLine)) break;
-        if (blockquoteBeginRegex.test(nextLine)) break;
-        if (nextBulletRegex.test(nextLine)) break;
-        if (hrRegex.test(nextLine)) break;
-        if (nextLineWithoutTabs.search(RE.nonSpace) >= indent || !nextLine.trim()) {
+        const nextLineWithoutTabs = (rawLine[0] === ' ' || rawLine[0] === '\t')
+          ? rawLine.replace(RE.leadSpaceTab, (ws) => expandTabs(ws))
+          : rawLine;
+        // First non-space character decides which break rules can match;
+        // the others are never even tried.
+        const firstNonSpace = nextLineWithoutTabs.search(RE.nonSpace);
+        const fc = firstNonSpace === -1 ? '' : nextLineWithoutTabs[firstNonSpace];
+        if ((fc === '`' || fc === '~') && fencesBeginRegex.test(nextLine)) break;
+        if (fc === '#' && headingBeginRegex.test(nextLine)) break;
+        if (fc === '<' && htmlBeginRegex.test(nextLine)) break;
+        if (fc === '>' && blockquoteBeginRegex.test(nextLine)) break;
+        if ((fc === '*' || fc === '+' || fc === '-' || (fc >= '0' && fc <= '9')) && nextBulletRegex.test(nextLine)) break;
+        if ((fc === '-' || fc === '_' || fc === '*') && hrRegex.test(nextLine)) break;
+        if (firstNonSpace >= indent || !nextLine.trim()) {
           itemContents += '\n' + nextLineWithoutTabs.slice(indent);
         } else {
           if (blankLine) break;
@@ -1408,7 +1439,7 @@ function parseList(src, pos, ctx) {
           itemContents += '\n' + continuation;
         }
         blankLine = !nextLine.trim();
-        cur += rawLine.length + 1;
+        cur = lineEnd + 1;
         line = nextLineWithoutTabs.slice(indent);
       }
     }
@@ -1714,18 +1745,25 @@ function renderNodes(nodes, ctx) {
 const PLAIN_INLINE = /[\\<!\[`*~_@]|www\.|https?:\/\/|ftp:\/\/|mailto:|xmpp:| {2,}\n/i;
 
 // Cheap pre-check for a bare URL / e-mail at `i`: only run the URL pattern
-// when the text here can actually start one.
+// when the text here can actually start one. Scheme/protocol checks compare
+// char codes directly (no lowercased slice is allocated).
 function maybeUrl(src, i) {
   const ch = src[i];
   if (ch === 'w' && src.startsWith('www.', i)) return true;
   if (ch === 'h' || ch === 'H' || ch === 'f' || ch === 'F') {
-    const rest = src.slice(i, i + 8).toLowerCase();
-    if (rest.startsWith('http://') || rest.startsWith('https://') || rest.startsWith('ftp://')) return true;
+    const a = src.charCodeAt(i + 1) | 32, b = src.charCodeAt(i + 2) | 32, c = src.charCodeAt(i + 3) | 32;
+    if ((ch === 'h' || ch === 'H') && a === 116 && b === 116 && c === 112) {
+      const d = src.charCodeAt(i + 4);
+      if (d === 58 && src[i + 5] === '/' && src[i + 6] === '/') return true;
+      if ((d | 32) === 115 && src[i + 5] === ':' && src[i + 6] === '/' && src[i + 7] === '/') return true;
+    } else if ((ch === 'f' || ch === 'F') && a === 116 && b === 112 && src[i + 3] === ':' && src[i + 4] === '/' && src[i + 5] === '/') return true;
     // Not a scheme: fall through to the e-mail check below.
   }
   if (ch === 'm' || ch === 'x') {
-    const rest = src.slice(i, i + 7).toLowerCase();
-    if (rest.startsWith('mailto:') || rest.startsWith('xmpp:')) return true;
+    const a = src.charCodeAt(i + 1) | 32, b = src.charCodeAt(i + 2) | 32, c = src.charCodeAt(i + 3) | 32,
+      d = src.charCodeAt(i + 4) | 32, e = src.charCodeAt(i + 5) | 32;
+    if (ch === 'm' && a === 97 && b === 105 && c === 108 && d === 116 && e === 111 && src[i + 6] === ':') return true;
+    if (ch === 'x' && a === 109 && b === 112 && c === 112 && src[i + 4] === ':') return true;
     // Not a protocol: fall through to the e-mail check below.
   }
   if (!isAlnum(ch)) return false;
