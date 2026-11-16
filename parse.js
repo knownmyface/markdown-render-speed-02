@@ -1235,8 +1235,12 @@ function parseList(lines, i, defs, srcEndsWithNewline) {
       let inFence = null; // fence char (` or ~) and length, or null
       // Track fence state from the item's first line (the opener may be
       // the content line itself); only blank lines after it can loosen.
-      let openList = null; // {indent, ordered, delim} of the nested
-                           // list currently open inside this item
+      // A STACK of nested lists open inside this item ({indent, ordered,
+      // delim}): a blank line is inside a nested list when the next
+      // line continues ANY list still open — not just the most recent
+      // one (a deeper "*" list can sit inside a "+" list, and the "+"
+      // list is still open when its next item follows the blank).
+      let openLists = [];
       for (let q = 0; q + 1 < itemLines.length; q++) {
         const lq = itemLines[q];
         const li = indentOf(lq);
@@ -1260,26 +1264,37 @@ function parseList(lines, i, defs, srcEndsWithNewline) {
           let r = q + 1;
           while (r < itemLines.length && isBlank(itemLines[r])) r++;
           if (r >= itemLines.length) break;
-          // If the next line continues the open nested list, the
+          // If the next line continues any still-open nested list, the
           // blank is inside that list, not a separator.
           const mr = matchListMarker(itemLines[r]);
-          if (openList && mr && indentOf(itemLines[r]) === openList.indent &&
-              mr.ordered === openList.ordered && mr.delim === openList.delim) {
-            continue;
+          if (mr) {
+            const ri = indentOf(itemLines[r]);
+            let inside = false;
+            for (let s = 0; s < openLists.length; s++) {
+              const ol = openLists[s];
+              if (ri === ol.indent && mr.ordered === ol.ordered &&
+                  mr.delim === ol.delim) { inside = true; break; }
+            }
+            if (inside) continue;
           }
           // Only a line at this item's own indent starts a new block here.
           if (indentOf(itemLines[r]) === 0) { loose = true; break; }
           continue;
         }
-        // Non-blank line: update the open nested list.
+        // Non-blank line: update the open nested lists. Deeper lists
+        // close when a line dedents to or below their indent.
         const mm = matchListMarker(lq);
         if (mm) {
-          if (!openList || li !== openList.indent ||
-              mm.ordered !== openList.ordered || mm.delim !== openList.delim) {
-            openList = { indent: li, ordered: mm.ordered, delim: mm.delim };
+          while (openLists.length > 0 &&
+                 openLists[openLists.length - 1].indent > li) openLists.pop();
+          const top = openLists[openLists.length - 1];
+          if (!top || top.indent !== li || top.ordered !== mm.ordered ||
+              top.delim !== mm.delim) {
+            openLists.push({ indent: li, ordered: mm.ordered, delim: mm.delim });
           }
-        } else if (openList && li < openList.indent) {
-          openList = null;
+        } else {
+          while (openLists.length > 0 &&
+                 openLists[openLists.length - 1].indent > li) openLists.pop();
         }
       }
     }
