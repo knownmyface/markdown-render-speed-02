@@ -1913,6 +1913,41 @@ function scanFailedLinkSpan(s, p) {
   return -1;
 }
 
+// Dangling backtick-run lengths in a link label, left to right, or [].
+// marked's anyPunctuationOutsideCode matches code spans left to right:
+// a run opens a code span when a later run of the SAME length exists
+// in the label (content may hold backticks); the span consumes through
+// its closer. A run with no same-length later run in the label is
+// dangling; the first dangling run that ALSO has a same-length run
+// later in the paragraph pairs with it, masking the whole region
+// between them — emphasis delimiters inside stay literal (doc-09/16/
+// 28/35). A label like `` a ` b `` (runs 2,1,2) is fully matched
+// (opener 2 pairs with the final 2), so it does NOT suppress (doc-33).
+function labelDanglingBacktickLens(labelText) {
+  const runs = [];
+  let i = 0;
+  while (i < labelText.length) {
+    const c = labelText[i];
+    if (c === '\\' && i + 1 < labelText.length) { i += 2; continue; }
+    if (c === '`') {
+      const n = runLen(labelText, i, '`');
+      runs.push(n);
+      i += n;
+      continue;
+    }
+    i++;
+  }
+  const dangling = [];
+  let a = 0;
+  while (a < runs.length) {
+    let b = a + 1;
+    while (b < runs.length && runs[b] !== runs[a]) b++;
+    if (b >= runs.length) { dangling.push(runs[a]); a++; }
+    else a = b + 1;
+  }
+  return dangling;
+}
+
 function scanInline(s, defs, inLink) {
   const parts = [];
   let i = 0;
@@ -1921,6 +1956,11 @@ function scanInline(s, defs, inLink) {
   // emphasis delimiters are hidden from resolveEmphasis, per marked's
   // blockSkip). Delimiters inside it are plain text.
   let maskUntil = -1;
+  // End of the mismatched-label suppression zone (see
+  // labelDanglingBacktickLen): a link whose label holds a
+  // dangling backtick run, plus a same-length backtick run later
+  // in the paragraph, suppresses emphasis delimiters until that run.
+  let emSuppressUntil = -1;
   const flush = (to) => {
     if (to > textStart) parts.push({ k: 0, s: s.slice(textStart, to) });
   };
@@ -2006,6 +2046,30 @@ function scanInline(s, defs, inLink) {
           if (link.title) a += ' title="' + escAttr(link.title) + '"';
           a += '>' + inner + '</a>';
           parts.push({ k: 1, s: a });
+          // A dangling backtick run in the label suppresses emphasis
+          // until the next same-length backtick run in this paragraph
+          // (marked's blockSkip masking, see
+          // labelDanglingBacktickLens): try each dangling length in
+          // order — the first one with a same-length run later in the
+          // paragraph is the opener of the masking span.
+          if (emSuppressUntil < 0) {
+            const danglingLens = labelDanglingBacktickLens(link.labelText);
+            for (let d = 0; d < danglingLens.length && emSuppressUntil < 0; d++) {
+              const want = danglingLens[d];
+              let j = link.next;
+              while (j < s.length) {
+                if (s[j] === '`') {
+                  const n = runLen(s, j, '`');
+                  if (n === want) { emSuppressUntil = j; break; }
+                  j += n;
+                } else if (s[j] === '\\' && j + 1 < s.length) {
+                  j += 2;
+                } else {
+                  j++;
+                }
+              }
+            }
+          }
           i = link.next;
           textStart = i;
           continue;
@@ -2057,6 +2121,9 @@ function scanInline(s, defs, inLink) {
       // Inside a masked failed-link span the delimiter is plain text
       // (marked's blockSkip hides it from emStrong).
       if (i < maskUntil) { i++; continue; }
+      // Inside a mismatched-label suppression zone the delimiter is
+      // plain text too (the region up to the next backtick is masked).
+      if (i < emSuppressUntil) { i++; continue; }
       const n = runLen(s, i, c);
       if (c === '~' && n >= 3) { i += n; continue; }
       flush(i);
@@ -2181,6 +2248,74 @@ function scanInline(s, defs, inLink) {
 // opener of the same char that can match, apply the rule of 3 (for * and _),
 // and wrap the content between them. A later match wraps an earlier one,
 // so ***a*** renders <em><strong>a</strong></em>.
+// Marked's emStrong forward scan, as a pairing check: from opener O,
+// maintain a counter m starting at O's run length. Inner delimiter
+// runs of the same char that are opener-like ADD their length to m;
+// can-both runs that are odd-match-skipped against O (O.n % 3 != 0 and
+// (O.n + D.n) % 3 == 0) neither add nor reduce m; a closer reduces m by
+// its length. A closer C can close O only when it brings m to <= 0 —
+// UNLESS a later closer exists for O, in which case C may still pair
+// with O as an inner span (the outer span then uses the later closer,
+// as in cm-408 "__foo_ bar_"). When C cannot bring m to 0 and no later
+// closer exists, O never forms a span, so the pairing is refused.
+function mCounterAllows(opener, closer, delims, spans) {
+  if (opener.ch === '~') return true;
+  let m = opener.on;
+  let hasInner = false;
+  for (let di = 0; di < delims.length; di++) {
+    const d = delims[di];
+    if (d.pos <= opener.pos || d.pos >= closer.pos) continue;
+    if (d.ch !== opener.ch) continue;
+    // A delimiter strictly inside an already-formed span does not
+    // count: it belongs to that span's content, not to this opener's
+    // scan (cm-470: the "*" before "baz" sits inside "__...__").
+    let inside = false;
+    for (let s = 0; s < spans.length; s++) {
+      if (spans[s][0] < d.pos && d.pos < spans[s][1]) { inside = true; break; }
+    }
+    if (inside) continue;
+    const dn = d.on;
+    if (dn <= 0) continue;
+    hasInner = true;
+    const canBoth = d.open && d.close;
+    const oddSkip = canBoth && (opener.on % 3 !== 0) &&
+      ((opener.on + dn) % 3 === 0);
+    if (d.open && !d.close) {
+      m += dn; // opener-like run: adds its length to m
+    } else if (d.close) {
+      if (oddSkip) continue; // skipped: neither adds nor reduces m
+      m -= dn;
+      if (m <= 0) return true; // D would close O before C; C pairs
+      // with O's leftover as an inner span, which is fine.
+    }
+  }
+  // No inner delimiter runs at all: plain partial use of a longer
+  // opener is fine (cm-442 "**foo*" -> "*<em>foo</em>").
+  if (!hasInner) return true;
+  if (closer.on >= m) return true;
+  // C cannot bring m to 0. Allow the pairing only if a later closer
+  // exists that fits the opener's leftover after this pairing
+  // (leftover = opener.n - use, use = min(opener.n, closer.n)).
+  // In cm-408 "__foo_ bar_" the "__" opener uses 1 now, leaving 1,
+  // and the later "_" (on=1) fits it. In doc-01 the "**" opener
+  // would leave 1, but the later "**" (on=2) does not fit — it is
+  // the opener's own matching closer, not a leftover-taker — so the
+  // pairing is refused. A same-length opener has nothing left, so an
+  // unrelated later delimiter must not rescue it (doc-03).
+  const use = Math.min(opener.n, closer.n);
+  const leftover = opener.n - use;
+  if (leftover > 0) {
+    for (let di = 0; di < delims.length; di++) {
+      const d = delims[di];
+      if (d.pos > closer.pos && d.ch === opener.ch && d.close && d.n > 0 &&
+          d.on <= leftover) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
 function resolveEmphasis(parts, src) {
   const delims = [];
   for (const p of parts) if (p.k === 2) delims.push(p);
@@ -2191,34 +2326,48 @@ function resolveEmphasis(parts, src) {
     const closer = delims[d];
     if (!closer.close) continue;
     while (closer.n > 0) {
-      let opener = null;
-      for (let e = d - 1; e >= 0; e--) {
-        const op = delims[e];
-        if (op.n <= 0 || !op.open || op.ch !== closer.ch) continue;
+      // Test one opener candidate against this closer; returns the
+      // opener if it may pair, else null.
+      const ok = (op) => {
+        if (op.n <= 0 || !op.open || op.ch !== closer.ch) return null;
         // Proper nesting: skip an opener trapped inside a formed span
         // that this closer sits outside of.
-        let trapped = false;
         for (let s = 0; s < spans.length; s++) {
-          if (spans[s][0] < op.pos && op.pos < spans[s][1] && closer.pos > spans[s][1]) { trapped = true; break; }
+          if (spans[s][0] < op.pos && op.pos < spans[s][1] && closer.pos > spans[s][1]) return null;
         }
-        if (trapped) continue;
         if (closer.ch === '~') {
           // Strikethrough: opener and closer must have the same length,
           // and the content must not start/end with whitespace.
-          if (op.n !== closer.n) continue;
+          if (op.n !== closer.n) return null;
           const afterOpen = src[op.pos + op.n];
           const beforeClose = src[closer.pos - 1];
-          if (afterOpen !== undefined && isSpace(afterOpen)) continue;
-          if (beforeClose !== undefined && isSpace(beforeClose)) continue;
+          if (afterOpen !== undefined && isSpace(afterOpen)) return null;
+          if (beforeClose !== undefined && isSpace(beforeClose)) return null;
         } else {
           // Rule of 3: only when one of the two delimiters can both
           // open and close emphasis.
           const sum = op.n + closer.n;
           if (sum % 3 === 0 && (op.n % 3 !== 0 || closer.n % 3 !== 0) &&
-              ((op.open && op.close) || (closer.open && closer.close))) continue;
+              ((op.open && op.close) || (closer.open && closer.close))) return null;
+          // Marked's emStrong m-counter: an inner opener-like run
+          // raises the length this closer must cover. It also governs
+          // partial use of a longer opener (cm-442 is allowed only
+          // when no inner runs interfere; doc-01 is refused because
+          // the inner "*so*" em blocks it).
+          if (!mCounterAllows(op, closer, delims, spans)) return null;
         }
-        opener = op;
-        break;
+        return op;
+      };
+      // Prefer an opener with the same original run length as the
+      // closer (leftmost-opener priority: a "**" closer belongs with
+      // a "**" opener, not with a nearer "*" opener — doc-11). Fall
+      // back to the nearest opener that may pair.
+      let opener = null;
+      for (let e = d - 1; e >= 0 && !opener; e--) {
+        if (delims[e].on === closer.on) opener = ok(delims[e]);
+      }
+      if (!opener) {
+        for (let e = d - 1; e >= 0 && !opener; e--) opener = ok(delims[e]);
       }
       if (!opener) break;
       let use;
@@ -2235,7 +2384,45 @@ function resolveEmphasis(parts, src) {
       const ci = parts.indexOf(closer);
       parts.splice(oi + 1, 0, { k: 1, s: '<' + tag + '>' });
       const ci2 = parts.indexOf(closer);
-      parts.splice(ci2, 0, { k: 1, s: '</' + tag + '>' });
+      // Leftover-inside rule (doc-30/doc-11): when a STRONG only
+      // partly consumes its closer run, the leftover delimiter renders
+      // INSIDE the span — but only when (a) no available opener could
+      // still pair with the leftover (otherwise the leftover belongs
+      // to a later, outer span and the tags must stay in nesting
+      // order, doc-16), and (b) the span contains an inner same-char
+      // em whose closer is directly adjacent to non-space text that
+      // runs into this closer ("*tool*one***" — the inner em's closer
+      // is glued to the following word; a space before the word, or
+      // no inner em at all, leaves the leftover outside).
+      let leftoverInside = false;
+      if (use === 2 && closer.n > 0) {
+        let availOpener = false;
+        for (let e = 0; e < delims.length; e++) {
+          const od = delims[e];
+          if (od.pos < closer.pos && od.n > 0 && od.open && od.ch === closer.ch) { availOpener = true; break; }
+        }
+        if (!availOpener) {
+          for (let s = 0; s < spans.length; s++) {
+            const sp = spans[s];
+            if (sp[0] <= opener.pos || sp[1] >= closer.pos) continue;
+            // Inner span's closer: find its delimiter part to get its
+            // original run length, then check the text from just after
+            // it to this closer has no whitespace.
+            let innerCloserLen = 0;
+            for (let e = 0; e < delims.length; e++) {
+              if (delims[e].pos === sp[1] && delims[e].ch === closer.ch) { innerCloserLen = delims[e].on; break; }
+            }
+            if (!innerCloserLen) continue;
+            const gap = src.slice(sp[1] + innerCloserLen, closer.pos);
+            if (gap.length > 0 && !/\s/.test(gap)) { leftoverInside = true; break; }
+          }
+        }
+      }
+      if (leftoverInside) {
+        parts.splice(ci2 + 1, 0, { k: 1, s: '</' + tag + '>' });
+      } else {
+        parts.splice(ci2, 0, { k: 1, s: '</' + tag + '>' });
+      }
     }
   }
   // Remaining delimiters become literal text.
