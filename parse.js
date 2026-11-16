@@ -231,6 +231,13 @@ function isPunct(ch) {
 }
 
 function isSpace(ch) {
+  // ASCII fast path: below 128 the only whitespace is space, tab,
+  // newline, carriage return, form feed and vertical tab.
+  const code = ch.charCodeAt(0);
+  if (code < 128) {
+    return code === 32 || code === 9 || code === 10 || code === 13 ||
+      code === 12 || code === 11;
+  }
   return ch === ' ' || ch === '\t' || ch === '\n' || ch === '\r' ||
     ch === '\f' || ch === '\v' || ch === ' ' || ch === ' ' || ch === ' ' ||
     ch === ' ' || ch === ' ' || ch === ' ' || ch === ' ' || ch === ' ' ||
@@ -1566,9 +1573,15 @@ function parseLinkAt(s, p, defs, isImage) {
 // Angle autolink <scheme:...> or <email> starting at s[p] === '<'.
 // Returns {text, href, next} or null.
 function tryAngleAutolink(s, p) {
-  if (p + 1 < s.length && /[A-Za-z]/.test(s[p + 1])) {
+  const c1 = s[p + 1];
+  if (p + 1 < s.length && ((c1 >= 'A' && c1 <= 'Z') || (c1 >= 'a' && c1 <= 'z'))) {
     let q = p + 1;
-    while (q < s.length && /[A-Za-z0-9+.-]/.test(s[q])) q++;
+    while (q < s.length) {
+      const cq = s[q];
+      if (!((cq >= 'A' && cq <= 'Z') || (cq >= 'a' && cq <= 'z') ||
+        (cq >= '0' && cq <= '9') || cq === '+' || cq === '.' || cq === '-')) break;
+      q++;
+    }
     const schemeLen = q - (p + 1);
     if (schemeLen >= 2 && schemeLen <= 32 && s[q] === ':') {
       let r = q + 1;
@@ -1606,11 +1619,15 @@ function isEmailLocal(ch) {
 // span still links, because marked tokenizes the address on the em's
 // inner text, where that closer is absent).
 function tryBareEmail(s, p, allowStrip) {
-  const at = s.indexOf('@', p);
-  if (at < 0 || at - p > 64) return null;
+  // Bounded scan: the local part is [A-Za-z0-9._+-]+, at most 64 chars
+  // before '@'. The old code did an unbounded indexOf('@', p) at every
+  // word start, scanning to the next '@' anywhere in the document.
+  // Scan the local run directly; it stops at the first non-local char
+  // (usually the word end, a few chars away) or after 64 chars.
   let q = p;
-  while (q < s.length && isEmailLocal(s[q])) q++;
-  if (q !== at) return null;
+  while (q < s.length && q - p < 64 && isEmailLocal(s[q])) q++;
+  if (q >= s.length || s[q] !== '@') return null;
+  const at = q;
   const local = s.slice(p, at);
   if (local.length === 0) return null;
   let r = at + 1;
@@ -1829,30 +1846,6 @@ function isAlnum(ch) {
     (ch >= '0' && ch <= '9');
 }
 
-// Left/right flanking per CommonMark. pre/post are the chars before/after
-// the delimiter run ('' at the string boundary, which counts as whitespace).
-function canOpenDelim(ch, pre, post) {
-  const preSpace = pre === '' || isSpace(pre);
-  const postSpace = post === '' || isSpace(post);
-  const prePunct = isPunct(pre);
-  const postPunct = isPunct(post);
-  const leftFlanking = !postSpace && (!postPunct || preSpace || prePunct);
-  const rightFlanking = !preSpace && (!prePunct || postSpace || postPunct);
-  if (ch === '_') return leftFlanking && (!rightFlanking || prePunct);
-  return leftFlanking;
-}
-
-function canCloseDelim(ch, pre, post) {
-  const preSpace = pre === '' || isSpace(pre);
-  const postSpace = post === '' || isSpace(post);
-  const prePunct = isPunct(pre);
-  const postPunct = isPunct(post);
-  const leftFlanking = !postSpace && (!postPunct || preSpace || prePunct);
-  const rightFlanking = !preSpace && (!prePunct || postSpace || postPunct);
-  if (ch === '_') return rightFlanking && (!leftFlanking || postPunct);
-  return rightFlanking;
-}
-
 // ---------- inline scanner ----------
 
 // Document-level "inside an <a> tag" state (marked's lexer.state.inLink).
@@ -1948,6 +1941,30 @@ function labelDanglingBacktickLens(labelText) {
   return dangling;
 }
 
+// Does s hold lit (lowercase ASCII) at i, case-insensitively, with no
+// allocation? (code | 32) lowercases ASCII letters; lit holds only
+// lowercase letters plus ':' and '/', whose bit-5 neighbours are control
+// characters, so the test is exact for this literal set. Out-of-range
+// charCodeAt gives NaN, which never matches.
+function hasPrefixCI(s, i, lit) {
+  for (let k = 0; k < lit.length; k++) {
+    const a = s.charCodeAt(i + k);
+    const b = lit.charCodeAt(k);
+    if (a !== b && (a | 32) !== b) return false;
+  }
+  return true;
+}
+
+// Next position in scanInline that can start a construct: two spaces
+// (hard break), a special char, 'h'/'H' (http:// has no word-boundary
+// rule, so it can start anywhere), or a word-start letter/digit/./_/+/-/-
+// (bare URL/email). The lookbehind is the URL boundary (previous char
+// not alphanumeric) — a superset of the email boundary, so no candidate
+// is missed. Everything skipped is plain text and stays in the flush
+// slice. Compiled once; lastIndex is set explicitly before every exec,
+// so reentrant scanInline calls (link labels) are safe.
+const NEXT_STOP = / {2}|[\\`\[<*_~!hH]|(?<![A-Za-z0-9])[A-Za-z0-9._+\-]/g;
+
 function scanInline(s, defs, inLink) {
   const parts = [];
   let i = 0;
@@ -1961,8 +1978,16 @@ function scanInline(s, defs, inLink) {
   // dangling backtick run, plus a same-length backtick run later
   // in the paragraph, suppresses emphasis delimiters until that run.
   let emSuppressUntil = -1;
+  // Next '@' / ':' at or after position 0, for the bare-email and
+  // generic-scheme pre-filters (Batch 5). Maintained incrementally:
+  // the native indexOf is called once per occurrence, not once per
+  // word start. A ':' more than 32 chars ahead cannot be a scheme
+  // and an '@' more than 64 ahead cannot be in the local part, so
+  // those word starts skip the scan entirely.
+  let nextAt = s.indexOf('@');
+  let nextColon = s.indexOf(':');
   const flush = (to) => {
-    if (to > textStart) parts.push({ k: 0, s: s.slice(textStart, to) });
+    if (to > textStart) parts.push({ k: 0, s: s.slice(textStart, to), ch: '', n: 0, on: 0, open: false, close: false, pos: -1 });
   };
   while (i < s.length) {
     const c = s[i];
@@ -1971,14 +1996,14 @@ function scanInline(s, defs, inLink) {
       const nc = s[i + 1];
       if (nc !== undefined && isAsciiPunct(nc)) {
         flush(i);
-        parts.push({ k: 1, s: escText(nc) });
+        parts.push({ k: 1, s: escText(nc), ch: '', n: 0, on: 0, open: false, close: false, pos: -1 });
         i += 2;
         textStart = i;
         continue;
       }
       if (nc === '\n') {
         flush(i);
-        parts.push({ k: 1, s: '<br>' });
+        parts.push({ k: 1, s: '<br>', ch: '', n: 0, on: 0, open: false, close: false, pos: -1 });
         i += 2;
         while (i < s.length && (s[i] === ' ' || s[i] === '\t')) i++;
         textStart = i;
@@ -1997,10 +2022,15 @@ function scanInline(s, defs, inLink) {
       flush(i);
       let code = s.slice(i + n, end);
       code = code.replace(/\r\n|\n/g, ' ');
-      if (code.length > 1 && code[0] === ' ' && code[code.length - 1] === ' ' && !/^[ ]+$/.test(code)) {
-        code = code.slice(1, -1);
+      if (code.length > 1 && code[0] === ' ' && code[code.length - 1] === ' ') {
+        // Strip one space from each end unless the span is all spaces.
+        let allSpaces = true;
+        for (let k = 1; k < code.length - 1; k++) {
+          if (code[k] !== ' ') { allSpaces = false; break; }
+        }
+        if (!allSpaces) code = code.slice(1, -1);
       }
-      parts.push({ k: 1, s: '<code>' + escText(code) + '</code>' });
+      parts.push({ k: 1, s: '<code>' + escText(code) + '</code>', ch: '', n: 0, on: 0, open: false, close: false, pos: -1 });
       i = end + n;
       textStart = i;
       continue;
@@ -2016,9 +2046,9 @@ function scanInline(s, defs, inLink) {
           let img = '<img src="' + escAttr(href) + '" alt="' + escAttr(alt) + '"';
           if (link.title) img += ' title="' + escAttr(link.title) + '"';
           img += '>';
-          parts.push({ k: 1, s: img });
+          parts.push({ k: 1, s: img, ch: '', n: 0, on: 0, open: false, close: false, pos: -1 });
         } else {
-          parts.push({ k: 0, s: s.slice(i, link.next) });
+          parts.push({ k: 0, s: s.slice(i, link.next), ch: '', n: 0, on: 0, open: false, close: false, pos: -1 });
         }
         i = link.next;
         textStart = i;
@@ -2045,7 +2075,7 @@ function scanInline(s, defs, inLink) {
           let a = '<a href="' + escAttr(href) + '"';
           if (link.title) a += ' title="' + escAttr(link.title) + '"';
           a += '>' + inner + '</a>';
-          parts.push({ k: 1, s: a });
+          parts.push({ k: 1, s: a, ch: '', n: 0, on: 0, open: false, close: false, pos: -1 });
           // A dangling backtick run in the label suppresses emphasis
           // until the next same-length backtick run in this paragraph
           // (marked's blockSkip masking, see
@@ -2091,9 +2121,9 @@ function scanInline(s, defs, inLink) {
         flush(i);
         const href = cleanUrl(auto.href);
         if (href !== null) {
-          parts.push({ k: 1, s: '<a href="' + escText(href) + '">' + escText(auto.text) + '</a>' });
+          parts.push({ k: 1, s: '<a href="' + escText(href) + '">' + escText(auto.text) + '</a>', ch: '', n: 0, on: 0, open: false, close: false, pos: -1 });
         } else {
-          parts.push({ k: 0, s: s.slice(i, auto.next) });
+          parts.push({ k: 0, s: s.slice(i, auto.next), ch: '', n: 0, on: 0, open: false, close: false, pos: -1 });
         }
         i = auto.next;
         textStart = i;
@@ -2106,9 +2136,11 @@ function scanInline(s, defs, inLink) {
         // An <a ...> opening tag (marked's startATag /^<a /i) sets the
         // document-level inLink; a </a> clears it. Only inline tags do
         // this — HTML blocks never reach scanInline.
-        if (!docInLink && /^<a /i.test(tagText)) docInLink = true;
-        else if (docInLink && /^<\/a>/i.test(tagText)) docInLink = false;
-        parts.push({ k: 1, s: tagText });
+        if (!docInLink && tagText.length >= 3 && tagText[0] === '<' &&
+            (tagText[1] === 'a' || tagText[1] === 'A') && tagText[2] === ' ') docInLink = true;
+        else if (docInLink && tagText.length >= 4 && tagText[0] === '<' && tagText[1] === '/' &&
+            (tagText[2] === 'a' || tagText[2] === 'A') && tagText[3] === '>') docInLink = false;
+        parts.push({ k: 1, s: tagText, ch: '', n: 0, on: 0, open: false, close: false, pos: -1 });
         i = tag.next;
         textStart = i;
         continue;
@@ -2135,10 +2167,25 @@ function scanInline(s, defs, inLink) {
         open = true;
         close = true;
       } else {
-        open = canOpenDelim(c, pre, post);
-        close = canCloseDelim(c, pre, post);
+        // Left/right flanking per CommonMark, computed once here. The
+        // old code called canOpenDelim + canCloseDelim, which each
+        // recomputed the same four tests (4 isSpace + 4 isPunct per
+        // delimiter run instead of 2 + 2).
+        const preSpace = pre === '' || isSpace(pre);
+        const postSpace = post === '' || isSpace(post);
+        const prePunct = isPunct(pre);
+        const postPunct = isPunct(post);
+        const leftFlanking = !postSpace && (!postPunct || preSpace || prePunct);
+        const rightFlanking = !preSpace && (!prePunct || postSpace || postPunct);
+        if (c === '_') {
+          open = leftFlanking && (!rightFlanking || prePunct);
+          close = rightFlanking && (!leftFlanking || postPunct);
+        } else {
+          open = leftFlanking;
+          close = rightFlanking;
+        }
       }
-      parts.push({ k: 2, ch: c, n, on: n, open, close, pos: i });
+      parts.push({ k: 2, s: '', ch: c, n, on: n, open, close, pos: i });
       i += n;
       textStart = i;
       continue;
@@ -2147,24 +2194,57 @@ function scanInline(s, defs, inLink) {
     // whitespace, *, _, ~, ( or at the start, and any other 2-32 char
     // scheme (mailto:, xmpp:, ...) at a word boundary. Schemes are
     // case-insensitive (Https:// linkifies). Never inside link text.
-    const lower7 = s.slice(i, i + 7).toLowerCase();
-    const lower8 = s.slice(i, i + 8).toLowerCase();
-    const colonAt = ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')) ? s.indexOf(':', i) : -1;
-    if (!inLink && !docInLink && ((lower7 === 'http://' || lower8 === 'https://') ||
-        (colonAt - i >= 2 && colonAt - i <= 32 &&
-         (i === 0 || !/[A-Za-z0-9]/.test(s[i - 1]))))) {
+    // Allocation-free pre-filter: the old code built two short
+    // lowercased strings per character (plus an unbounded indexOf(':')
+    // per letter). Correctness still rests on tryBareUrl, which
+    // re-validates the candidate, so the pre-filter only needs to be
+    // a superset of real candidates.
+    if (!inLink && !docInLink) {
+      let urlCand = false;
+      if (c === 'h' || c === 'H') {
+        // http:// or https://, anywhere (no word-boundary rule).
+        urlCand = hasPrefixCI(s, i, 'http://') || hasPrefixCI(s, i, 'https://');
+      }
+      if (!urlCand && ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z'))) {
+        // Generic scheme: 2-32 [A-Za-z0-9+.-] chars then ':', at a
+        // word boundary (previous char not alphanumeric).
+        let boundary = i === 0;
+        if (!boundary) {
+          const pc = s[i - 1];
+          boundary = !((pc >= 'A' && pc <= 'Z') || (pc >= 'a' && pc <= 'z') ||
+            (pc >= '0' && pc <= '9'));
+        }
+        if (boundary) {
+          // Only scan for a scheme when a ':' is within 32 chars
+          // (necessary condition); the scan still validates the
+          // scheme charset, so this is a pure pre-filter.
+          if (nextColon >= 0 && nextColon < i) nextColon = s.indexOf(':', i);
+          if (nextColon >= 0 && nextColon - i <= 32) {
+          let q = i + 1;
+          while (q < s.length && q - i <= 32) {
+            const qc = s[q];
+            if (!((qc >= 'A' && qc <= 'Z') || (qc >= 'a' && qc <= 'z') ||
+              (qc >= '0' && qc <= '9') || qc === '+' || qc === '.' || qc === '-')) break;
+            q++;
+          }
+          urlCand = q - i >= 2 && q - i <= 32 && s[q] === ':';
+          }
+        }
+      }
+      if (urlCand) {
       const url = tryBareUrl(s, i);
       if (url) {
         flush(i);
         const href = cleanUrl(url.href);
         if (href !== null) {
-          parts.push({ k: 1, s: '<a href="' + escText(href) + '">' + escText(url.text) + '</a>' });
+          parts.push({ k: 1, s: '<a href="' + escText(href) + '">' + escText(url.text) + '</a>', ch: '', n: 0, on: 0, open: false, close: false, pos: -1 });
         } else {
-          parts.push({ k: 0, s: url.text });
+          parts.push({ k: 0, s: url.text, ch: '', n: 0, on: 0, open: false, close: false, pos: -1 });
         }
         i = url.next;
         textStart = i;
         continue;
+      }
       }
     }
     if (!inLink && !docInLink && c === 'w' && s.startsWith('www.', i) &&
@@ -2174,9 +2254,9 @@ function scanInline(s, defs, inLink) {
         flush(i);
         const href = cleanUrl(url.href);
         if (href !== null) {
-          parts.push({ k: 1, s: '<a href="' + escText(href) + '">' + escText(url.text) + '</a>' });
+          parts.push({ k: 1, s: '<a href="' + escText(href) + '">' + escText(url.text) + '</a>', ch: '', n: 0, on: 0, open: false, close: false, pos: -1 });
         } else {
-          parts.push({ k: 0, s: url.text });
+          parts.push({ k: 0, s: url.text, ch: '', n: 0, on: 0, open: false, close: false, pos: -1 });
         }
         i = url.next;
         textStart = i;
@@ -2191,8 +2271,23 @@ function scanInline(s, defs, inLink) {
     // text, where that closer is absent), so it links then; a '_'
     // with no open '_' span, or a trailing '-', invalidates it
     // (gfm-632: a.b-c_d@a.b- and a.b-c_d@a.b_ are plain text).
-    if (!inLink && !docInLink && isEmailLocal(c) && (i === 0 || !isEmailLocal(s[i - 1]))) {
-      const email = tryBareEmail(s, i, true);
+    // Local-part chars [A-Za-z0-9._+-], inlined: the old code called
+    // isEmailLocal twice per character.
+    if (!inLink && !docInLink &&
+        ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+         (c >= '0' && c <= '9') || c === '.' || c === '_' || c === '+' || c === '-')) {
+      let boundary = i === 0;
+      if (!boundary) {
+        const pc = s[i - 1];
+        boundary = !((pc >= 'A' && pc <= 'Z') || (pc >= 'a' && pc <= 'z') ||
+          (pc >= '0' && pc <= '9') || pc === '.' || pc === '_' || pc === '+' || pc === '-');
+      }
+      if (boundary) {
+      // Only run the email scan when an '@' is within the 64-char
+      // local-part window (necessary condition); tryBareEmail still
+      // validates the local part, so this is a pure pre-filter.
+      if (nextAt >= 0 && nextAt < i) nextAt = s.indexOf('@', i);
+      const email = (nextAt >= 0 && nextAt - i <= 64) ? tryBareEmail(s, i, true) : null;
       if (email) {
         const afterCh = s[email.next];
         let badTail = afterCh !== undefined &&
@@ -2212,14 +2307,15 @@ function scanInline(s, defs, inLink) {
           flush(i);
           const href = cleanUrl(email.href);
           if (href !== null) {
-            parts.push({ k: 1, s: '<a href="' + escText(href) + '">' + escText(email.text) + '</a>' });
+            parts.push({ k: 1, s: '<a href="' + escText(href) + '">' + escText(email.text) + '</a>', ch: '', n: 0, on: 0, open: false, close: false, pos: -1 });
           } else {
-            parts.push({ k: 0, s: email.text });
+            parts.push({ k: 0, s: email.text, ch: '', n: 0, on: 0, open: false, close: false, pos: -1 });
           }
           i = email.next;
           textStart = i;
           continue;
         }
+      }
       }
     }
     // Hard break: two or more spaces before a newline. A hard break
@@ -2230,14 +2326,19 @@ function scanInline(s, defs, inLink) {
       while (j < s.length && s[j] === ' ') j++;
       if (j - i >= 2 && s[j] === '\n') {
         flush(i);
-        parts.push({ k: 1, s: '<br>' });
+        parts.push({ k: 1, s: '<br>', ch: '', n: 0, on: 0, open: false, close: false, pos: -1 });
         i = j + 1;
         while (i < s.length && (s[i] === ' ' || s[i] === '\t')) i++;
         textStart = i;
         continue;
       }
     }
-    i++;
+    // Plain-text fast path: jump to the next position that can start a
+    // construct (see NEXT_STOP). Everything skipped is plain text and
+    // stays in the flush slice.
+    NEXT_STOP.lastIndex = i + 1;
+    const nm = NEXT_STOP.exec(s);
+    i = nm ? nm.index : s.length;
   }
   flush(s.length);
   return parts;
@@ -2382,7 +2483,7 @@ function resolveEmphasis(parts, src) {
       spans.push([opener.pos, closer.pos]);
       const oi = parts.indexOf(opener);
       const ci = parts.indexOf(closer);
-      parts.splice(oi + 1, 0, { k: 1, s: '<' + tag + '>' });
+      parts.splice(oi + 1, 0, { k: 1, s: '<' + tag + '>', ch: '', n: 0, on: 0, open: false, close: false, pos: -1 });
       const ci2 = parts.indexOf(closer);
       // Leftover-inside rule (doc-30/doc-11): when a STRONG only
       // partly consumes its closer run, the leftover delimiter renders
@@ -2419,23 +2520,18 @@ function resolveEmphasis(parts, src) {
         }
       }
       if (leftoverInside) {
-        parts.splice(ci2 + 1, 0, { k: 1, s: '</' + tag + '>' });
+        parts.splice(ci2 + 1, 0, { k: 1, s: '</' + tag + '>', ch: '', n: 0, on: 0, open: false, close: false, pos: -1 });
       } else {
-        parts.splice(ci2, 0, { k: 1, s: '</' + tag + '>' });
+        parts.splice(ci2, 0, { k: 1, s: '</' + tag + '>', ch: '', n: 0, on: 0, open: false, close: false, pos: -1 });
       }
     }
   }
-  // Remaining delimiters become literal text.
-  for (const p of parts) {
-    if (p.k === 2) {
-      p.k = 0;
-      p.s = p.ch.repeat(p.n);
-      delete p.ch;
-      delete p.n;
-      delete p.open;
-      delete p.close;
-      delete p.pos;
-    }
+  // Remaining delimiters become literal text. Mutate in place: the
+  // part keeps its shape (all parts share one hidden class), so no
+  // fresh object and no `delete` (which would force dictionary mode).
+  for (let pi = 0; pi < parts.length; pi++) {
+    const p = parts[pi];
+    if (p.k === 2) { p.k = 0; p.s = p.ch.repeat(p.n); }
   }
 }
 
@@ -2444,11 +2540,14 @@ function renderInline(s, defs, inLink) {
   if (!needsInlineScan(s)) return renderText(s);
   const parts = scanInline(s, defs, inLink);
   resolveEmphasis(parts, s);
-  let out = '';
+  // Collect then join once: `out +=` over hundreds of parts builds a
+  // deep cons-string tree that V8 flattens repeatedly (quadratic in
+  // the number of parts); a single join is one allocation + one copy.
+  const chunks = [];
   for (const p of parts) {
-    out += p.k === 0 ? renderText(p.s) : p.s;
+    chunks.push(p.k === 0 ? renderText(p.s) : p.s);
   }
-  return out;
+  return chunks.join('');
 }
 
 // Unescape the 5 basic entities once (&amp; &lt; &gt; &quot; &#39;).
@@ -2507,7 +2606,10 @@ function stripInlineFormatting(s, defs) {
 // definitions into defs; pass 2 (renderBlocks) renders inline from the
 // complete defs, so a definition may appear after its use.
 export function parse(markdown) {
-  const src = String(markdown).replace(/\r\n?/g, '\n');
+  // Skip the whole-document \r scan when the input has no \r at all
+  // (the common case): String.replace would scan it anyway.
+  let src = String(markdown);
+  if (src.indexOf('\r') >= 0) src = src.replace(/\r\n?/g, '\n');
   const lines = src.split('\n');
   // A trailing newline produces a phantom empty line from split(); it is
   // not a real line (the source-end state is carried by srcEndsWithNewline).
